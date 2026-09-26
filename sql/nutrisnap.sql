@@ -48,3 +48,12 @@ CREATE TABLE IF NOT EXISTS nutrisnap_usage (
   KEY idx_nutrisnap_usage_expiry (expires_at),
   CONSTRAINT fk_nutrisnap_usage_user FOREIGN KEY (user_id) REFERENCES nutrisnap_users(id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- Shared admission counters; expired rows may be deleted by scheduled maintenance.
+CREATE TABLE IF NOT EXISTS nutrisnap_api_limits (
+  key_hash CHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  attempts INT UNSIGNED NOT NULL DEFAULT 0,
+  expires_at DATETIME(3) NOT NULL,
+  PRIMARY KEY (key_hash),
+  KEY idx_nutrisnap_api_limit_expiry (expires_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;

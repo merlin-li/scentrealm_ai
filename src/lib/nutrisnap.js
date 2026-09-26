@@ -1,4 +1,5 @@
 const { createStore } = require('./nutrisnap-db')
+const { createSecurity, positive, digest } = require('./nutrisnap-security')
 const MAX_IMAGE = 3 * 1024 * 1024
 function fail(status, message) { return Object.assign(new Error(message), { status }) }
 function imageData(image) {
@@ -32,11 +33,12 @@ async function requestJson(fetcher, url, options, ms) {
     throw fail(abort.signal.aborted ? 504 : 502, abort.signal.aborted ? '服务请求超时，请重试' : '服务连接失败，请稍后重试')
   } finally { clearTimeout(timer) }
 }
-function createHandlers({ env = process.env, fetcher = globalThis.fetch, store = createStore() } = {}) {
+function createHandlers({ env = process.env, fetcher = globalThis.fetch, store = createStore(), security = createSecurity() } = {}) {
   async function login(req) {
     if (!env.NUTRISNAP_WECHAT_APPID || !env.NUTRISNAP_WECHAT_SECRET) throw fail(503, '微信登录服务尚未配置')
     const code = req.body && req.body.code
     if (typeof code !== 'string' || !code.length || code.length > 256) throw fail(400, '微信登录凭证无效')
+    await security.consume([{ key: 'login:global', seconds: 60, limit: positive(env, 'NUTRISNAP_LOGIN_PER_MINUTE', 120) }])
     const url = new URL('https://api.weixin.qq.com/sns/jscode2session')
     url.search = new URLSearchParams({ appid: env.NUTRISNAP_WECHAT_APPID, secret: env.NUTRISNAP_WECHAT_SECRET, js_code: code, grant_type: 'authorization_code' }).toString()
     const data = await requestJson(fetcher, url, {}, 10000)
@@ -45,13 +47,22 @@ function createHandlers({ env = process.env, fetcher = globalThis.fetch, store =
   }
   async function recognize(req) {
     const user = await store.authenticate(req.headers.authorization)
+    if (env.NUTRISNAP_AI_ENABLED === 'false') throw fail(503, '识别服务暂停，请使用手动记录')
+    const allowlist = (env.NUTRISNAP_AI_ALLOWED_USER_IDS || '').split(',').map(x => x.trim()).filter(Boolean)
+    if (allowlist.length && !allowlist.includes(user.id)) throw fail(403, '当前账号暂未开放 AI 识别')
     const image = imageData(req.body && req.body.image)
     if (!env.NUTRISNAP_VISION_API_KEY) throw fail(503, '图片识别服务尚未配置')
     const base = env.NUTRISNAP_VISION_BASE_URL || 'https://maas.qianwenaiapi.com/compatible-mode/v1'
     if (!base.startsWith('https://')) throw fail(503, '识别服务配置无效')
-    const configuredLimit = Number(env.NUTRISNAP_DAILY_RECOGNITION_LIMIT || 50)
-    const dailyLimit = Number.isInteger(configuredLimit) && configuredLimit > 0 && configuredLimit <= 500 ? configuredLimit : 50
+    const dailyLimit = positive(env, 'NUTRISNAP_DAILY_RECOGNITION_LIMIT', 50)
+    const policies = [
+      { key: 'ai:global:minute', seconds: 60, limit: positive(env, 'NUTRISNAP_AI_GLOBAL_PER_MINUTE', 30) },
+      { key: 'ai:global:day', seconds: 86400, limit: positive(env, 'NUTRISNAP_AI_GLOBAL_PER_DAY', 500), message: '今日识别服务额度已用完，请使用手动记录' },
+      { key: 'ai:user:' + user.id, seconds: 10, limit: 1 },
+      { key: 'ai:image:' + user.id + ':' + digest(image), seconds: 60, limit: 1, message: '这张照片刚刚已提交，请稍后再试' }
+    ]
     await store.consumeQuota(user.id, dailyLimit)
+    await security.consume(policies)
     const data = await requestJson(fetcher, base.replace(/\/$/, '') + '/chat/completions', {
       method: 'POST', headers: { 'content-type': 'application/json', authorization: `Bearer ${env.NUTRISNAP_VISION_API_KEY}` },
       body: JSON.stringify({ model: env.NUTRISNAP_VISION_MODEL || 'qwen3.8-flash', enable_thinking: false, temperature: 0.1, max_tokens: 1600,
@@ -64,6 +75,7 @@ function createHandlers({ env = process.env, fetcher = globalThis.fetch, store =
   }
   async function records(req) {
     const user = await store.authenticate(req.headers.authorization)
+    await security.consume([{ key: 'records:' + user.id, seconds: 60, limit: 120 }])
     const body = req.body || {}
     switch (body.action) {
       case 'list': return store.list(user.id, body.cursor)
@@ -82,7 +94,10 @@ function createHandlers({ env = process.env, fetcher = globalThis.fetch, store =
       res.setHeader('Cache-Control', 'no-store')
       if (req.method !== 'POST') { res.setHeader('Allow', 'POST'); return res.status(405).json({ error: '请使用 POST' }) }
       try { return res.status(200).json(await action(req)) }
-      catch (error) { return res.status(error.status || 503).json({ error: error.status ? error.message : '服务暂不可用，请稍后重试' }) }
+      catch (error) {
+        if (error.status === 429) res.setHeader('Retry-After', String(error.retryAfter || 60))
+        return res.status(error.status || 503).json({ error: error.status ? error.message : '服务暂不可用，请稍后重试' })
+      }
     }
   }
   return { login: route(login), recognize: route(recognize), records: route(records), logout: route(logout) }
