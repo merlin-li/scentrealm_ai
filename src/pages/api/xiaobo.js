@@ -144,9 +144,6 @@ export default async function handler(req, res) {
         result = null
       }
 
-      success = false
-      result = null
-
       console.log('result:--------------')
       console.log({
         code: 200,
